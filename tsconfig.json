@@ -1,0 +1,13 @@
+{
+  "include": ["src"],
+  "compilerOptions": {
+    "allowJs": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "dist",
+    "checkJs": false,
+    "strict": true,
+    "module": "esnext",
+    "target": "esnext"
+  }
+}
