@@ -6,7 +6,9 @@
   "scripts": {
     "build": "vite build && tsc --emitDeclarationOnly",
     "test": "vitest",
-    "types": "tsc"
+    "types": "tsc",
+    "benchmark": "node benchmark/index.js",
+    "benchmark:compare": "node benchmark/compare.js"
   },
   "exports": {
     ".": {
@@ -15,8 +17,13 @@
   },
   "import": "./dist/signal.js",
   "devDependencies": {
+    "@preact/signals": "^2.0.4",
+    "solid-js": "^1.9.5",
     "typescript": "^5.8.3",
     "vite": "^6.3.1",
     "vitest": "^3.1.2"
+  },
+  "dependencies": {
+    "tinybench": "^4.0.1"
   }
 }

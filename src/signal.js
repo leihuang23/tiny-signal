@@ -1,510 +1,480 @@
-/**
- * Tiny reactive signal system adapted from SolidJS.
- * (https://github.com/solidjs/solid/blob/main/packages/solid/src/reactive/signal.ts)
- * Provides primitives for creating reactive signals, memos, and effects.
- *
- * @module tiny-signal
- */
+import {
+  valueChanged,
+  topologicalSort,
+  subscribe,
+  clearDeps,
+  ComputationQueue,
+} from "./utils.js";
 
-let Listener = null;
-let Updates = null;
-let Effects = null;
-let ExecCount = 0;
-let Scheduler = null;
-let Middleware = [];
+let currentComputation = null;
+let batched = null;
+let effects = null;
+let scheduler = null;
+const middleware = [];
+const typeMiddleware = {};
+const MAX_POOL_SIZE = 50;
+const ctxPool = [];
 
-/**
- * Applies all registered middleware to a value.
- * @param {string} type - The type of operation ('get', 'set', 'compute', etc.).
- * @param {*} value - The value to transform.
- * @param {Object} context - Additional context for the middleware.
- * @returns {*} The transformed value.
- * @private
- */
-function applyMiddleware(type, value, context = {}) {
-  return Middleware.reduce((result, middleware) => {
-    try {
-      const transformed = middleware(type, result, context);
-      return transformed !== undefined ? transformed : result;
-    } catch (err) {
-      console.error("Middleware error:", err);
-      return result;
+const STALE = 1 << 0; // 1
+const USER_EFFECT = 1 << 1; // 2
+const QUEUED = 1 << 2; // 4
+const RUNNING = 1 << 3; // 8
+const DISPOSED = 1 << 4; // 16
+const ERROR = 1 << 5; // 32
+
+let hasMiddleware = false;
+
+function getCtx() {
+  return ctxPool.pop() || {};
+}
+
+function releaseCtx(ctx) {
+  if (ctxPool.length >= MAX_POOL_SIZE) return;
+  for (const key in ctx) {
+    delete ctx[key];
+  }
+  ctxPool.push(ctx);
+}
+
+function applyMiddleware(type, value, ctx) {
+  // Fast path for no middleware
+  if (!hasMiddleware && !typeMiddleware[type]?.length) return value;
+  
+  // Check type-specific middleware first
+  const typeMiddlewares = typeMiddleware[type];
+  if (typeMiddlewares?.length) {
+    for (let i = 0; i < typeMiddlewares.length; i++) {
+      try {
+        value = typeMiddlewares[i](type, value, ctx) ?? value;
+      } catch (err) {
+        console.error(`[tiny-signal] Type middleware error in "${type}":`, err);
+      }
     }
-  }, value);
-}
-
-/**
- * Subscribes a computation to a set of subscriptions.
- * @param {Object} running - The computation to subscribe.
- * @param {Set} subscriptions - The set of subscriptions.
- * @private
- */
-function subscribe(running, subscriptions) {
-  subscriptions.add(running);
-  running.dependencies.add(subscriptions);
-}
-
-/**
- * Clears all dependencies for a computation.
- * @param {Object} running - The computation whose dependencies are to be cleared.
- * @private
- */
-function clearDependencies(running) {
-  for (const dep of running.dependencies) {
-    dep.delete(running);
-  }
-  running.dependencies.clear();
-}
-
-/**
- * Runs all computations in a queue.
- * @param {Array} queue - The queue of computations.
- * @private
- */
-function runQueue(queue) {
-  for (let i = 0; i < queue.length; i++) {
-    runTop(queue[i]);
-  }
-}
-
-/**
- * Runs all effects in a queue, separating user effects from system effects.
- * @param {Array} queue - The queue of effects.
- * @private
- */
-function runEffects(queue) {
-  let userEffects = [];
-
-  for (let i = 0; i < queue.length; i++) {
-    const e = queue[i];
-    if (!e.user) runTop(e);
-    else userEffects.push(e);
   }
 
-  for (let i = 0; i < userEffects.length; i++) {
-    runTop(userEffects[i]);
+  // Then general middleware
+  if (!hasMiddleware) return value;
+
+  const len = middleware.length;
+  for (let i = 0; i < len; i++) {
+    try {
+      value = middleware[i](type, value, ctx) ?? value;
+    } catch (err) {
+      console.error(
+        `[tiny-signal] Middleware error in "${type}" at index ${i}:`,
+        err
+      );
+    }
   }
+  return value;
 }
 
-/**
- * Runs updates in a batch, handling errors and effect completion.
- * @param {Function} fn - The function to run.
- * @param {boolean} [init] - Whether this is an initial run.
- * @returns {*} The result of the function.
- * @private
- */
-function runUpdates(fn, init) {
-  if (Updates) return fn();
+function runUpdates(fn) {
+  if (batched) return fn(); // Already in a batch
 
-  let wait = false;
-  if (!init) Updates = [];
-  if (Effects) wait = true;
-  else Effects = [];
+  const computationQueue = new ComputationQueue();
+  const effectQueue = new ComputationQueue();
 
-  ExecCount++;
+  // Initialize batching state
+  batched = [];
+  effects = [];
+  let result;
 
   try {
-    const res = fn();
-    completeUpdates(wait);
-    return res;
-  } catch (err) {
-    if (!wait) Effects = null;
-    Updates = null;
-    throw err;
-  }
-}
+    result = fn();
 
-/**
- * Completes all pending updates and effects.
- * @param {boolean} wait - Whether to wait for effects.
- * @private
- */
-function completeUpdates(wait) {
-  if (Updates) {
-    if (Scheduler) {
-      scheduleQueue(Updates);
-    } else {
-      runQueue(Updates);
-    }
-    Updates = null;
-  }
+    // Sort computations topologically to minimize recalculations
+    if (batched.length > 0) {
+      const sortedComputations = topologicalSort(batched);
 
-  if (wait) return;
+      // Add to appropriate queue
+      for (let i = 0; i < sortedComputations.length; i++) {
+        const comp = sortedComputations[i];
+        if (comp.flags & DISPOSED) continue;
 
-  const e = Effects;
-  Effects = null;
-
-  if (e.length) {
-    runUpdates(() => runEffects(e), false);
-  }
-}
-
-/**
- * Schedules a queue of computations using the Scheduler.
- * @param {Array} queue - The queue to schedule.
- * @private
- */
-function scheduleQueue(queue) {
-  for (let i = 0; i < queue.length; i++) {
-    const item = queue[i];
-    Scheduler(() => {
-      runUpdates(() => runTop(item), false);
-    });
-  }
-}
-
-/**
- * Executes a computation if it is not already up-to-date.
- * @param {Object} running - The computation to run.
- * @private
- */
-function runTop(running) {
-  if (running.state === 0) return;
-  running.execute();
-}
-
-/**
- * Creates a computation object for memoization or effects.
- * @param {Function} fn - The computation function.
- * @param {boolean} [pure=false] - Whether the computation is pure.
- * @returns {Object} The computation object.
- * @private
- */
-function createComputation(fn, pure = false) {
-  const computation = {
-    fn,
-    state: 1,
-    dependencies: new Set(),
-    pure,
-    user: !pure,
-
-    execute() {
-      if (this.state === 0) return this.value;
-
-      clearDependencies(this);
-
-      const prevListener = Listener;
-      Listener = this;
-
-      try {
-        applyMiddleware("beforeCompute", null, {
-          computation: this,
-          pure,
-        });
-
-        const result = fn();
-
-        const processedResult = applyMiddleware("compute", result, {
-          computation: this,
-          pure,
-        });
-
-        this.value = processedResult;
-        this.state = 0;
-        return processedResult;
-      } finally {
-        Listener = prevListener;
-
-        applyMiddleware("afterCompute", null, {
-          computation: this,
-          pure,
-        });
+        // User effects go to main queue, others to effect queue
+        if (comp.flags & USER_EFFECT) {
+          computationQueue.add(comp, 1); // Lower priority, run after deps
+        } else {
+          effectQueue.add(comp, 0); // Higher priority
+        }
       }
+
+      // Process computation queue
+      if (scheduler) {
+        while (!computationQueue.isEmpty) {
+          const comp = computationQueue.next();
+          scheduler(() => runComputation(comp));
+        }
+      } else {
+        while (!computationQueue.isEmpty) {
+          runComputation(computationQueue.next());
+        }
+      }
+    }
+
+    // Process effect queue
+    while (!effectQueue.isEmpty) {
+      runComputation(effectQueue.next());
+    }
+
+    // Process remaining user effects
+    if (effects.length > 0) {
+      for (let i = 0; i < effects.length; i++) {
+        const effect = effects[i];
+        if (effect.flags & DISPOSED) continue;
+        runComputation(effect);
+      }
+    }
+
+    computationQueue.clear();
+    effectQueue.clear();
+    effects = null;
+    batched = null;
+    return result;
+  } catch (e) {
+    computationQueue.clear();
+    effectQueue.clear();
+    batched = null;
+    effects = null;
+    throw e;
+  }
+}
+
+function runComputation(computation) {
+  if (computation.flags & DISPOSED) return computation.value;
+  if (!(computation.flags & STALE)) return computation.value;
+
+  // Mark as running to prevent re-entry
+  computation.flags |= RUNNING;
+  computation.flags &= ~STALE;
+
+  clearDeps(computation);
+  const prev = currentComputation;
+  currentComputation = computation;
+
+  try {
+    const ctx = hasMiddleware ? getCtx() : null;
+
+    if (hasMiddleware) {
+      ctx.computation = computation;
+      ctx.isUser = !!(computation.flags & USER_EFFECT);
+      applyMiddleware("beforeCompute", null, ctx);
+    }
+
+    let result = computation.fn();
+
+    if (hasMiddleware) {
+      ctx.result = result;
+      const transformed = applyMiddleware("compute", result, ctx);
+      if (transformed !== undefined) result = transformed;
+      releaseCtx(ctx);
+    }
+
+    computation.value = result;
+    computation.flags &= ~RUNNING;
+    return result;
+  } catch (err) {
+    computation.flags |= ERROR;
+    computation.flags &= ~RUNNING;
+    console.error("[tiny-signal] Computation error:", err);
+    throw err;
+  } finally {
+    currentComputation = prev;
+    if (hasMiddleware) {
+      const ctx = getCtx();
+      ctx.computation = computation;
+      ctx.isUser = !!(computation.flags & USER_EFFECT);
+      applyMiddleware("afterCompute", null, ctx);
+      releaseCtx(ctx);
+    }
+  }
+}
+
+// Create a computation object with execution capabilities
+function createComputation(fn, isUser) {
+  return {
+    fn,
+    flags: STALE | (isUser ? USER_EFFECT : 0),
+    deps: new Set(),
+    value: undefined,
+    execute() {
+      if (this.flags & DISPOSED) return;
+      return runComputation(this);
+    },
+    dispose() {
+      if (this.flags & DISPOSED) return;
+      clearDeps(this);
+      this.flags |= DISPOSED;
     },
   };
-
-  return computation;
 }
 
-// #region: Public API
 /**
  * Enables scheduling of updates using a specified scheduler.
- * @param {"animation"|"idle"|Function} [scheduler="animation"] - The scheduler to use for batching updates.
- *   - "animation": Uses `requestAnimationFrame` for scheduling.
- *   - "idle": Uses `window.requestIdleCallback` if available, otherwise falls back to `setTimeout`.
- *   - Function: A custom scheduling function that receives a callback to execute.
+ * @param {"animation"|"idle"|Function} [s="animation"]
  */
-export function enableScheduling(scheduler = "animation") {
-  if (scheduler === "animation") {
-    Scheduler = requestAnimationFrame;
-  } else if (scheduler === "idle") {
-    Scheduler = window.requestIdleCallback || ((fn) => setTimeout(fn, 1));
-  } else if (typeof scheduler === "function") {
-    Scheduler = scheduler;
-  }
+export function enableScheduling(s = "animation") {
+  scheduler =
+    s === "animation"
+      ? requestAnimationFrame
+      : s === "idle"
+      ? typeof window !== "undefined" && window.requestIdleCallback
+        ? window.requestIdleCallback
+        : (fn) => setTimeout(fn, 1)
+      : typeof s === "function"
+      ? s
+      : null;
 }
 
 /**
  * Creates a reactive signal.
  * @template T
- * @param {T} initialValue - The initial value of the signal.
- * @param {Object} [options] - Signal options.
- * @returns {{
- *   value: T,
- *   subscribe: (subscriber: Object) => () => void
- * }}
+ * @param {T} initial
+ * @param {Object} [options]
  */
-export function signal(initialValue, options = {}) {
-  let value = initialValue;
-  const subscriptions = new Set();
+export function signal(initial, options = {}) {
+  // Lazy subscription set creation
+  let subs = null;
+  const ctx = hasMiddleware ? { type: "signal", ...options } : null;
+  let value = hasMiddleware ? applyMiddleware("init", initial, ctx) : initial;
 
-  if (Middleware.length > 0) {
-    value = applyMiddleware("init", value, {
-      type: "signal",
-      ...options,
-    });
+  function ensureSubs() {
+    if (!subs) {
+      subs = new Set();
+      // Add owner reference for topological sorting
+      subs.owner = currentComputation;
+    }
+    return subs;
+  }
+
+  // Add a dispose method for manual cleanup
+  function dispose() {
+    if (subs) subs.clear();
+    subs = null;
   }
 
   return {
     get value() {
-      if (Listener) subscribe(Listener, subscriptions);
-
-      if (Middleware.length > 0) {
-        return applyMiddleware("get", value, {
-          type: "signal",
-          ...options,
-        });
+      if (currentComputation) {
+        subscribe(currentComputation, ensureSubs());
       }
-      return value;
+      return hasMiddleware ? applyMiddleware("get", value, ctx) : value;
     },
+
     peek() {
-      if (Middleware.length > 0) {
-        return applyMiddleware("peek", value, {
-          type: "signal",
-          ...options,
-        });
-      }
-      return value;
+      return hasMiddleware ? applyMiddleware("peek", value, ctx) : value;
     },
-    set value(nextValue) {
-      let processedValue = nextValue;
-      if (Middleware.length > 0) {
-        processedValue = applyMiddleware("set", nextValue, {
-          type: "signal",
-          prevValue: value,
-          ...options,
-        });
+
+    set value(next) {
+      if (hasMiddleware) {
+        const nextCtx = getCtx();
+        Object.assign(nextCtx, ctx || {});
+        nextCtx.prevValue = value;
+        next = applyMiddleware("set", next, nextCtx);
+        releaseCtx(nextCtx);
       }
 
-      if (Object.is(value, processedValue)) return;
-      value = processedValue;
+      // Only update if the value has actually changed
+      const changed = valueChanged(value, next);
+      if (!changed) return;
+
+      value = next;
+      if (!subs || !subs.size) return;
 
       runUpdates(() => {
-        for (const sub of [...subscriptions]) {
-          sub.state = 1;
-          if (sub.pure) {
-            if (!Updates) Updates = [];
-            Updates.push(sub);
-          } else {
-            if (!Effects) Effects = [];
-            Effects.push(sub);
-          }
+        // Use iterator to avoid temporary array allocation
+        const it = subs.values();
+        let computation;
+        while (!(computation = it.next()).done) {
+          computation = computation.value;
+          if (computation.flags & DISPOSED) continue;
+          computation.flags |= STALE;
+          (computation.flags & USER_EFFECT ? effects : batched).push(
+            computation
+          );
         }
-      }, false);
+      });
     },
+
+    dispose,
   };
 }
 
 /**
  * Creates a memoized computation that updates when its dependencies change.
  * @template T
- * @param {Function} fn - The computation function.
- * @returns {() => T} A function that returns the memoized value.
+ * @param {Function} fn
+ * @returns {() => T} Memo getter with a dispose method
  */
 export function memo(fn) {
   const computation = createComputation(fn, true);
+  runUpdates(() => computation.execute());
 
-  runUpdates(() => {
-    computation.execute();
-  }, false);
+  function getter() {
+    return computation.value;
+  }
 
-  return () => computation.value;
+  getter.dispose = () => computation.dispose();
+  return getter;
+}
+
+/**
+ * Creates a read-only computed signal derived from other signals.
+ * @template T
+ * @param {Function} fn
+ * @param {Object} [options]
+ * @returns {{ get value(): T, peek(): T, dispose(): void }}
+ */
+export function computed(fn, options = {}) {
+  const computation = createComputation(fn, true);
+  runUpdates(() => computation.execute());
+
+  const computedCtx = hasMiddleware ? { type: "computed", ...options } : null;
+
+  return {
+    get value() {
+      if (currentComputation) subscribe(currentComputation, computation.deps);
+      if (computation.flags & STALE) runComputation(computation);
+
+      return hasMiddleware
+        ? applyMiddleware("get", computation.value, computedCtx)
+        : computation.value;
+    },
+
+    peek() {
+      if (computation.flags & STALE) runComputation(computation);
+      return hasMiddleware
+        ? applyMiddleware("peek", computation.value, computedCtx)
+        : computation.value;
+    },
+
+    dispose() {
+      computation.dispose();
+    },
+  };
 }
 
 /**
  * Creates a reactive effect that runs when its dependencies change.
- * @param {Function} fn - The effect function. May return a cleanup function.
- * @returns {Object} The effect computation object.
+ * @param {Function} fn
+ * @returns {Object} The computation object with a dispose method
  */
 export function effect(fn) {
-  let lastCleanup;
-  let isRunning = false;
-
-  const running = createComputation(() => {
-    if (isRunning) {
-      if (import.meta.env?.DEV) {
-        throw new Error(
-          "Potential infinite loop detected: effect() called during re-entrancy."
-        );
-      }
-      return;
+  let cleanup;
+  const computation = createComputation(() => {
+    if (hasMiddleware) {
+      const ctx = getCtx();
+      ctx.fn = fn;
+      applyMiddleware("beforeEffect", null, ctx);
+      releaseCtx(ctx);
     }
 
-    applyMiddleware("beforeEffect", null, { fn });
-    isRunning = true;
-
-    try {
-      if (lastCleanup) {
-        lastCleanup();
-        lastCleanup = null;
-      }
-
-      const cleanupFn = fn();
-      if (typeof cleanupFn === "function") {
-        lastCleanup = cleanupFn;
-      }
-
-      applyMiddleware("afterEffect", null, { fn, cleanup: lastCleanup });
-    } finally {
-      isRunning = false;
+    if (cleanup) {
+      cleanup();
+      cleanup = null;
     }
-  }, false);
 
-  running.user = true;
+    const result = fn();
+    if (typeof result === "function") cleanup = result;
 
-  runUpdates(() => {
-    running.execute();
-  }, false);
+    if (hasMiddleware) {
+      const ctx = getCtx();
+      ctx.fn = fn;
+      ctx.cleanup = cleanup;
+      applyMiddleware("afterEffect", null, ctx);
+      releaseCtx(ctx);
+    }
+  }, true);
 
-  return running;
+  runUpdates(() => computation.execute());
+
+  return {
+    dispose: () => {
+      if (cleanup) cleanup();
+      computation.dispose();
+    },
+    get disposed() {
+      return !!(computation.flags & DISPOSED);
+    },
+  };
 }
 
 /**
  * Batches multiple updates into a single transaction.
- * @param {Function} fn - The function to batch.
- * @returns {*} The result of the function.
+ * @param {Function} fn
  */
 export function batch(fn) {
-  applyMiddleware("beforeBatch", null, { fn });
+  if (hasMiddleware) {
+    const ctx = getCtx();
+    ctx.fn = fn;
+    applyMiddleware("beforeBatch", null, ctx);
+    releaseCtx(ctx);
+  }
 
-  const result = runUpdates(fn, false);
+  const result = runUpdates(fn);
 
-  return applyMiddleware("afterBatch", result, { fn });
+  if (hasMiddleware) {
+    const ctx = getCtx();
+    ctx.fn = fn;
+    const transformed = applyMiddleware("afterBatch", result, ctx);
+    releaseCtx(ctx);
+    return transformed;
+  }
+
+  return result;
 }
 
 /**
- * Registers middlewares to intercept and transform signals and computations.
- * Can accept a single middleware function or an array of middleware functions.
- * @param {Function|Function[]} middlewareFn - A function or array of functions that receive (type, value, context) and return a new value or undefined.
- * @returns {Function} A function to remove the registered middleware(s).
+ * Registers middleware(s) to intercept and transform signals and computations.
+ * @param {Function|Function[]} m
+ * @param {Array<string>} [types] Optional array of specific operation types to intercept
  */
-export function use(middlewareFn) {
-  const fns = Array.isArray(middlewareFn) ? middlewareFn : [middlewareFn];
-  Middleware.push(...fns);
+export function use(m, types) {
+  const fns = Array.isArray(m) ? m : [m];
+
+  if (types && types.length) {
+    // Register for specific types
+    types.forEach((type) => {
+      typeMiddleware[type] = typeMiddleware[type] || [];
+      typeMiddleware[type].push(...fns);
+    });
+  } else {
+    // Register for all types
+    middleware.push(...fns);
+  }
+
+  hasMiddleware = middleware.length > 0;
+  let removed = false;
+
   return () => {
-    for (const fn of fns) {
-      const index = Middleware.indexOf(fn);
-      if (index !== -1) {
-        Middleware.splice(index, 1);
-      }
-    }
-  };
-}
-// #endregion
+    if (removed) return;
+    removed = true;
 
-// #region: Middleware
-/**
- * Creates a middleware for logging signal operations.
- * @param {Object} options - Configuration options.
- * @param {boolean} [options.logGets=false] - Whether to log get operations.
- * @param {boolean} [options.logSets=true] - Whether to log set operations.
- * @param {boolean} [options.logComputes=false] - Whether to log computation results.
- * @param {boolean} [options.logEffects=false] - Whether to log effect executions.
- * @returns {Function} A middleware function.
- */
-export function createLoggerMiddleware(options = {}) {
-  const {
-    logGets = false,
-    logSets = true,
-    logComputes = false,
-    logEffects = false,
-  } = options;
+    if (types && types.length) {
+      types.forEach((type) => {
+        if (!typeMiddleware[type]) return;
 
-  return (type, value, context) => {
-    if (type === "get" && logGets) {
-      console.log(`[signal:get]`, value);
-    } else if (type === "set" && logSets) {
-      console.log(`[signal:set]`, context.prevValue, "→", value);
-    } else if (type === "compute" && logComputes) {
-      console.log(`[signal:compute]`, value, context);
-    } else if (type === "beforeEffect" && logEffects) {
-      console.log(`[signal:effect:start]`, context);
-    } else if (type === "afterEffect" && logEffects) {
-      console.log(`[signal:effect:end]`, context);
-    }
+        fns.forEach((fn) => {
+          const idx = typeMiddleware[type].indexOf(fn);
+          if (idx > -1) {
+            typeMiddleware[type].splice(idx, 1);
+          }
+        });
 
-    return value;
-  };
-}
-
-/**
- * Creates middleware that validates signal values.
- * @param {Function} validator - Function that receives value and returns boolean.
- * @param {Function} [errorHandler] - Optional handler for invalid values.
- * @returns {Function} A middleware function.
- */
-export function createValidatorMiddleware(validator, errorHandler) {
-  return (type, value, context) => {
-    if (type === "set" || type === "init") {
-      if (!validator(value, context)) {
-        if (errorHandler) {
-          return errorHandler(value, context);
+        if (typeMiddleware[type].length === 0) {
+          delete typeMiddleware[type];
         }
-        console.error(`[signal:validation] Value failed validation:`, value);
-        return context.prevValue; // Return previous value if validation fails
-      }
-    }
-    return value;
-  };
-}
-
-/**
- * Creates middleware for persisting signal values to localStorage.
- * @param {Object} options - Global configuration options.
- * @param {Function} [options.serialize] - Function to serialize values (defaults to JSON.stringify).
- * @param {Function} [options.deserialize] - Function to deserialize values (defaults to JSON.parse).
- * @returns {Function} A middleware function.
- */
-export function createPersistMiddleware(options = {}) {
-  const { serialize = JSON.stringify, deserialize = JSON.parse } = options;
-
-  return (type, value, context) => {
-    if (!context.persist) {
-      return value;
-    }
-
-    const key = context.persist.key;
-    if (!key) {
-      console.warn("[persist] Missing storage key in persist options", context);
-      return value;
-    }
-
-    const signalOptions = context.persist;
-    const signalSerialize = signalOptions.serialize || serialize;
-    const signalDeserialize = signalOptions.deserialize || deserialize;
-
-    if (type === "init") {
-      try {
-        const stored = localStorage.getItem(key);
-        if (stored != null) {
-          return signalDeserialize(stored);
+      });
+    } else {
+      fns.forEach((fn) => {
+        let idx;
+        while ((idx = middleware.indexOf(fn)) > -1) {
+          middleware.splice(idx, 1);
         }
-      } catch (err) {
-        console.error(`[persist] Failed to load value for key "${key}":`, err);
-      }
-
-      return value ?? signalOptions.defaultValue;
+      });
     }
 
-    if (type === "set") {
-      try {
-        localStorage.setItem(key, signalSerialize(value));
-      } catch (err) {
-        console.error(`[persist] Failed to save value for key "${key}":`, err);
-      }
-    }
-
-    return value;
+    hasMiddleware = middleware.length > 0;
   };
 }
-// #endregion
