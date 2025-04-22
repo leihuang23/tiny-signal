@@ -3,9 +3,9 @@ import { defineConfig } from "vite";
 export default defineConfig({
   build: {
     lib: {
-      entry: "src/signal.js",
+      entry: "src/index.js",
       name: "TinySignal",
-      fileName: "signal",
+      fileName: "index",
       formats: ["es"],
     },
   },

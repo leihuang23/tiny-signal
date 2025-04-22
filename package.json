@@ -12,10 +12,10 @@
   },
   "exports": {
     ".": {
-      "import": "./dist/signal.js"
+      "import": "./dist/index.js"
     }
   },
-  "import": "./dist/signal.js",
+  "import": "./dist/index.js",
   "devDependencies": {
     "@preact/signals": "^2.0.4",
     "solid-js": "^1.9.5",

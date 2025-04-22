@@ -1,5 +1,4 @@
 import {
-  valueChanged,
   topologicalSort,
   subscribe,
   clearDeps,
@@ -24,10 +23,23 @@ const ERROR = 1 << 5; // 32
 
 let hasMiddleware = false;
 
+/**
+ * @private
+ * Retrieves a context object from the pool for middleware execution.
+ *
+ * @returns {Object} Empty context object
+ */
 function getCtx() {
   return ctxPool.pop() || {};
 }
 
+/**
+ * @private
+ * Returns a context object to the pool after use, clearing all properties.
+ *
+ * @param {Object} ctx - The context object to release
+ * @returns {void}
+ */
 function releaseCtx(ctx) {
   if (ctxPool.length >= MAX_POOL_SIZE) return;
   for (const key in ctx) {
@@ -36,10 +48,19 @@ function releaseCtx(ctx) {
   ctxPool.push(ctx);
 }
 
+/**
+ * @private
+ * Applies middleware transformations to a value based on operation type.
+ *
+ * @param {string} type - The operation type (e.g., 'get', 'set', 'init')
+ * @param {any} value - The value to transform
+ * @param {Object|null} ctx - Additional context information for middleware
+ * @returns {any} The transformed value after middleware processing
+ */
 function applyMiddleware(type, value, ctx) {
   // Fast path for no middleware
   if (!hasMiddleware && !typeMiddleware[type]?.length) return value;
-  
+
   // Check type-specific middleware first
   const typeMiddlewares = typeMiddleware[type];
   if (typeMiddlewares?.length) {
@@ -69,6 +90,16 @@ function applyMiddleware(type, value, ctx) {
   return value;
 }
 
+/**
+ * @private
+ * Executes a function within a batch context and processes all resulting updates.
+ * Handles topological sorting of computations and scheduling of updates.
+ *
+ * @template T
+ * @param {function(): T} fn - Function to execute within the batch
+ * @returns {T} The result of the executed function
+ * @throws {Error} Rethrows any errors from the executed function
+ */
 function runUpdates(fn) {
   if (batched) return fn(); // Already in a batch
 
@@ -141,6 +172,18 @@ function runUpdates(fn) {
   }
 }
 
+/**
+ * @private
+ * Executes a computation to update its value and track dependencies.
+ *
+ * @param {Object} computation - Computation object to run
+ * @param {function(): any} computation.fn - The computation function
+ * @param {number} computation.flags - Bit flags for computation state
+ * @param {Set<Object>} computation.deps - Set of dependencies
+ * @param {any} computation.value - Cached value of the computation
+ * @returns {any} Result of the computation
+ * @throws {Error} Rethrows any errors from the computation function
+ */
 function runComputation(computation) {
   if (computation.flags & DISPOSED) return computation.value;
   if (!(computation.flags & STALE)) return computation.value;
@@ -191,7 +234,21 @@ function runComputation(computation) {
   }
 }
 
-// Create a computation object with execution capabilities
+/**
+ * @private
+ * Creates a computation object that can track dependencies and cache results.
+ *
+ * @param {function(): any} fn - Function defining the computation
+ * @param {boolean} isUser - Whether this is a user-defined effect
+ * @returns {{
+ *   fn: function(): any,
+ *   flags: number,
+ *   deps: Set<Object>,
+ *   value: any,
+ *   execute(): any,
+ *   dispose(): void
+ * }} Computation object with execution and cleanup capabilities
+ */
 function createComputation(fn, isUser) {
   return {
     fn,
@@ -211,8 +268,14 @@ function createComputation(fn, isUser) {
 }
 
 /**
- * Enables scheduling of updates using a specified scheduler.
- * @param {"animation"|"idle"|Function} [s="animation"]
+ * @public
+ * Configures how reactive updates are scheduled.
+ *
+ * @param {'animation'|'idle'|Function} [s='animation'] - Scheduling strategy:
+ *   - 'animation': Uses requestAnimationFrame
+ *   - 'idle': Uses requestIdleCallback (falls back to setTimeout)
+ *   - Function: Custom scheduler function
+ * @returns {void}
  */
 export function enableScheduling(s = "animation") {
   scheduler =
@@ -228,10 +291,19 @@ export function enableScheduling(s = "animation") {
 }
 
 /**
- * Creates a reactive signal.
+ * @public
+ * Creates a reactive signal with getter/setter semantics.
+ *
  * @template T
- * @param {T} initial
- * @param {Object} [options]
+ * @param {T} initial - Initial value of the signal
+ * @param {Object} [options={}] - Configuration options
+ * @param {string} [options.name] - Optional name for debugging
+ * @returns {{
+ *   get value(): T,
+ *   set value(v: T): void,
+ *   peek(): T,
+ *   dispose(): void
+ * }} A reactive signal object
  */
 export function signal(initial, options = {}) {
   // Lazy subscription set creation
@@ -275,9 +347,7 @@ export function signal(initial, options = {}) {
         releaseCtx(nextCtx);
       }
 
-      // Only update if the value has actually changed
-      const changed = valueChanged(value, next);
-      if (!changed) return;
+      if (Object.is(value, next)) return;
 
       value = next;
       if (!subs || !subs.size) return;
@@ -302,10 +372,12 @@ export function signal(initial, options = {}) {
 }
 
 /**
- * Creates a memoized computation that updates when its dependencies change.
+ * @public
+ * Creates a memoized computation that updates only when dependencies change.
+ *
  * @template T
- * @param {Function} fn
- * @returns {() => T} Memo getter with a dispose method
+ * @param {function(): T} fn - Function that computes the value
+ * @returns {function(): T & {dispose(): void}} Memoized getter with cleanup method
  */
 export function memo(fn) {
   const computation = createComputation(fn, true);
@@ -320,11 +392,19 @@ export function memo(fn) {
 }
 
 /**
- * Creates a read-only computed signal derived from other signals.
+ * @public
+ * Creates a read-only computed signal derived from other reactive sources.
+ * Automatically tracks dependencies and updates when they change.
+ *
  * @template T
- * @param {Function} fn
- * @param {Object} [options]
- * @returns {{ get value(): T, peek(): T, dispose(): void }}
+ * @param {function(): T} fn - Function that computes the derived value
+ * @param {Object} [options={}] - Configuration options
+ * @param {string} [options.name] - Optional name for debugging
+ * @returns {{
+ *   get value(): T,
+ *   peek(): T,
+ *   dispose(): void
+ * }} A read-only computed signal
  */
 export function computed(fn, options = {}) {
   const computation = createComputation(fn, true);
@@ -356,9 +436,15 @@ export function computed(fn, options = {}) {
 }
 
 /**
- * Creates a reactive effect that runs when its dependencies change.
- * @param {Function} fn
- * @returns {Object} The computation object with a dispose method
+ * @public
+ * Creates a reactive effect that runs automatically when dependencies change.
+ *
+ * @param {function(): (void|function(): void)} fn - Effect function that may return
+ *   an optional cleanup function
+ * @returns {{
+ *   dispose(): void,
+ *   get disposed(): boolean
+ * }} Object to control the effect lifecycle
  */
 export function effect(fn) {
   let cleanup;
@@ -401,8 +487,13 @@ export function effect(fn) {
 }
 
 /**
- * Batches multiple updates into a single transaction.
- * @param {Function} fn
+ * @public
+ * Batches multiple updates into a single transaction to improve performance.
+ * Defers all reactive updates until the batch completes.
+ *
+ * @template T
+ * @param {function(): T} fn - Function containing multiple updates
+ * @returns {T} The return value of the batched function
  */
 export function batch(fn) {
   if (hasMiddleware) {
@@ -426,9 +517,14 @@ export function batch(fn) {
 }
 
 /**
- * Registers middleware(s) to intercept and transform signals and computations.
- * @param {Function|Function[]} m
- * @param {Array<string>} [types] Optional array of specific operation types to intercept
+ * @public
+ * Registers middleware to intercept and transform signal operations.
+ *
+ * @param {Function|Function[]} m - Middleware function(s) with signature:
+ *   (type: string, value: any, ctx: Object) => any
+ * @param {string[]} [types] - Optional array of operation types to intercept
+ *   (e.g., 'init', 'get', 'set', 'compute', 'beforeEffect', 'afterEffect')
+ * @returns {function(): void} Function to unregister the middleware
  */
 export function use(m, types) {
   const fns = Array.isArray(m) ? m : [m];
@@ -478,3 +574,9 @@ export function use(m, types) {
     hasMiddleware = middleware.length > 0;
   };
 }
+
+// export aliases
+export const createSignal = signal;
+export const createEffect = effect;
+export const createMemo = memo;
+export const derive = computed;

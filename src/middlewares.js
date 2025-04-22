@@ -13,6 +13,7 @@ export function createLoggerMiddleware(options = {}) {
     return value;
   };
 }
+
 export function createValidatorMiddleware(validator, errorHandler) {
   return (type, value, context) => {
     if (type === "set" || type === "init") {
