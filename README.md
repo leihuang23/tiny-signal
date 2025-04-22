@@ -1,7 +1,8 @@
 # tiny-signal
 
-A tiny, dependency-tracking reactive signal system.  
-This library provides fine-grained reactivity with signals, computed values, effects, batching, and extensible middleware.  
+A tiny reactive signal system.
+
+This library provides fine-grained reactivity with signals, computed values, effects, batching, and extensible middleware.
 
 **Note:** This is a study project and not intended for production use.
 
